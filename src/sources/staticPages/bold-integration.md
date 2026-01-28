@@ -20,91 +20,75 @@ Both systems deal with specimen data and sample tracking. BOLD tracks biological
 
 ## Scenario 1: BOLD Process ID Linking to DiSSCover Specimens
 
+> **📋 Full Technical Specification Available**: A detailed implementation guide for BOLD developers is available at [Scenario 1 Technical Specification](/bold-integration-scenario1-spec). This comprehensive document includes complete API documentation, code examples in JavaScript/TypeScript, Python, and PHP, UI component specifications, and testing checklists suitable for implementation by coding agents.
+
+### Summary
+
+This scenario enables BOLD to query DiSSCover's public search API to discover if a Digital Specimen record exists for a given sample. **This can be implemented entirely on the BOLD side** using DiSSCover's existing read-only API endpoints—the only DiSSCover-side requirement is CORS header configuration.
+
 ### User Story
 As a researcher using BOLD, I want to see when a sample I'm working with has a corresponding Digital Specimen in DiSSCover, so I can access additional metadata, media, and annotations associated with the physical specimen.
 
-### Implementation Overview
+### Key Integration Points
 
-#### BOLD Interface Addition
-Add a "DiSSCover Link" panel in the BOLD specimen detail view that displays:
-- DiSSCover DOI badge (when a match is found)
-- Link to the specimen page in DiSSCover
-- Summary of available annotations and media
-- MIDS (Minimum Information about a Digital Specimen) level indicator
+| Aspect | Details |
+|--------|---------|
+| **API Endpoint** | `GET https://dev.dissco.tech/api/digital-specimen/v1/search` |
+| **Authentication** | None required (public read-only API) |
+| **Query Parameters** | `q` (free-text), `$filter.physicalSpecimenId`, `$filter.collectionCode`, etc. |
+| **Response Format** | JSON with `data[]`, `links`, and `meta` objects |
 
-#### API Workflow
+### Identifier Query Strategies
+
+BOLD can query DiSSCover using multiple identifier types:
+
+1. **BOLD Process ID**: `?q=BOLD:AAA1234-21` or `?q=AAA1234-21`
+2. **Catalog Number**: `?q=RMNH.INS.12345` or `?$filter.physicalSpecimenId=RMNH.INS.12345`
+3. **Collection + Number**: `?$filter.collectionCode=RMNH&q=12345`
+4. **Taxonomic Search**: `?$filter.species=Apis%20mellifera&$filter.country=Netherlands`
+
+### BOLD Interface Addition
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         BOLD Interface                               │
+│  DiSSCover Digital Specimen Link                                [?] │
 ├─────────────────────────────────────────────────────────────────────┤
-│  Sample Record: BOLD:AAA1234                                        │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │  DiSSCover Integration Panel                                  │   │
-│  │  ┌─────────────────────────────────────────────────────────┐ │   │
-│  │  │ 🔗 Digital Specimen Found                               │ │   │
-│  │  │ DOI: 10.3535/TEST-DOI-123                               │ │   │
-│  │  │ Organisation: Naturalis Biodiversity Center             │ │   │
-│  │  │ MIDS Level: 2 ████░░                                    │ │   │
-│  │  │ [View in DiSSCover] [View Annotations] [View Media]     │ │   │
-│  │  └─────────────────────────────────────────────────────────┘ │   │
-│  └─────────────────────────────────────────────────────────────────┘ │
+│  ✓ Digital Specimen Found                                           │
+│                                                                     │
+│  DOI: 20.5000.1025/ABC-123-XYZ                                     │
+│  MIDS Level: 2  ██████████░░░░░░  (67%)                            │
+│  Institution: Naturalis Biodiversity Center (RMNH)                  │
+│  Media Available: Yes 📷                                            │
+│                                                                     │
+│  [View in DiSSCover]  [Copy DOI]                                   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-#### API Endpoint Structure
+### CORS Access Request
 
-**1. BOLD to DiSSCover Query**
-```http
-GET /digital-specimen/v1/search?physicalSpecimenID={BOLD_SAMPLE_ID}
-Accept: application/json
+To enable browser-based JavaScript calls from BOLD to DiSSCover, send this request to `support@dissco.eu`:
+
+```
+Subject: CORS Access Request for BOLD Systems Integration
+
+Please add the following origins to your CORS allowed origins:
+- https://boldsystems.org
+- https://www.boldsystems.org
+- https://dev.boldsystems.org
+
+The integration will use read-only GET requests to /api/digital-specimen/v1/search
 ```
 
-**2. Response Structure**
-```json
-{
-  "data": [{
-    "id": "https://doi.org/10.3535/TEST-DOI-123",
-    "type": "ods:DigitalSpecimen",
-    "attributes": {
-      "digitalSpecimen": {
-        "@id": "https://doi.org/10.3535/TEST-DOI-123",
-        "@type": "ods:DigitalSpecimen",
-        "ods:physicalSpecimenID": "BOLD:AAA1234",
-        "ods:specimenName": "Apis mellifera",
-        "ods:midsLevel": 2,
-        "ods:organisationName": "Naturalis Biodiversity Center",
-        "ods:isKnownToContainMedia": true,
-        "ods:hasIdentifiers": [{
-          "@type": "ods:Identifier",
-          "dcterms:title": "BOLD Process ID",
-          "dcterms:type": "Other",
-          "dcterms:identifier": "BOLD:AAA1234"
-        }]
-      }
-    }
-  }],
-  "links": {
-    "self": "https://dev.dissco.tech/digital-specimen/v1/search?physicalSpecimenID=BOLD:AAA1234"
-  },
-  "meta": {
-    "totalRecords": 1
-  }
-}
-```
+### Implementation Effort
 
-#### Implementation Requirements
+| BOLD-side Tasks | DiSSCo-side Tasks |
+|-----------------|-------------------|
+| Implement API client | Configure CORS headers |
+| Add UI component | (No code changes needed) |
+| Cache results | |
+| Handle errors | |
 
-For BOLD:
-1. Add a configuration option for DiSSCover API endpoint URL
-2. Implement asynchronous lookup on specimen detail page load
-3. Cache results to minimize API calls
-4. Handle cases where no DiSSCover record exists
-
-For DiSSCover:
-1. Ensure `ods:physicalSpecimenID` search supports BOLD Process IDs
-2. Support BOLD Process ID format in `ods:hasIdentifiers` array
-3. Provide CORS headers for BOLD domain
+**Estimated BOLD development time**: 2-3 days for experienced developer
 
 ---
 
