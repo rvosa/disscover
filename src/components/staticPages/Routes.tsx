@@ -4,6 +4,8 @@ import { Route } from "react-router-dom";
 /* Import Components */
 import About from "./About";
 import Acknowledgements from "./Acknowledgements";
+import BoldIntegration from "./BoldIntegration";
+import BoldIntegrationScenario1Spec from "./BoldIntegrationScenario1Spec";
 import PrivacyPolicy from "./PrivacyPolicy";
 import Terms from "./Terms";
 
@@ -12,6 +14,8 @@ import Terms from "./Terms";
 const routes = [
     <Route key="about" path="/about" element={<About />} />,
     <Route key="acknowledgements" path="/acknowledgements" element={<Acknowledgements />} />,
+    <Route key="boldIntegration" path="/bold-integration" element={<BoldIntegration />} />,
+    <Route key="boldIntegrationScenario1Spec" path="/bold-integration-scenario1-spec" element={<BoldIntegrationScenario1Spec />} />,
     <Route key="privacy" path="/privacy" element={<PrivacyPolicy />} />,
     <Route key="terms" path="/terms" element={<Terms />} />
 ];
