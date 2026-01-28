@@ -35,7 +35,7 @@ As a researcher using BOLD, I want to see when a sample I'm working with has a c
 |--------|---------|
 | **API Endpoint** | `GET https://dev.dissco.tech/api/digital-specimen/v1/search` |
 | **Authentication** | None required (public read-only API) |
-| **Query Parameters** | `q` (free-text), `$filter.physicalSpecimenId`, `$filter.collectionCode`, etc. |
+| **Query Parameters** | `q` (free-text), `physicalSpecimenId`, `collectionCode`, etc. |
 | **Response Format** | JSON with `data[]`, `links`, and `meta` objects |
 
 ### Identifier Query Strategies
@@ -43,9 +43,9 @@ As a researcher using BOLD, I want to see when a sample I'm working with has a c
 BOLD can query DiSSCover using multiple identifier types:
 
 1. **BOLD Process ID**: `?q=BOLD:AAA1234-21` or `?q=AAA1234-21`
-2. **Catalog Number**: `?q=RMNH.INS.12345` or `?$filter.physicalSpecimenId=RMNH.INS.12345`
-3. **Collection + Number**: `?$filter.collectionCode=RMNH&q=12345`
-4. **Taxonomic Search**: `?$filter.species=Apis%20mellifera&$filter.country=Netherlands`
+2. **Catalog Number**: `?q=RMNH.INS.12345` or `?physicalSpecimenId=RMNH.INS.12345`
+3. **Collection + Number**: `?collectionCode=RMNH&q=12345`
+4. **Taxonomic Search**: `?species=Apis%20mellifera&country=Netherlands`
 
 ### BOLD Interface Addition
 

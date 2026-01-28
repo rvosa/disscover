@@ -78,18 +78,20 @@ GET /api/digital-specimen/v1/search?q=BOLD:AAA1234-21
 
 ### 3.2 Structured Filter Parameters
 
-For more precise queries, use filter parameters prefixed with `$filter.`:
+For more precise queries, use filter parameters as direct query parameters (no prefix):
 
 | Parameter | Type | Description | Example |
 |-----------|------|-------------|---------|
-| `$filter.physicalSpecimenId` | string | Exact match on physical specimen ID | `RMNH.INS.12345` |
-| `$filter.organisationName` | string | Institution name | `Naturalis Biodiversity Center` |
-| `$filter.collectionCode` | string | Collection code/acronym | `RMNH`, `ZMA` |
-| `$filter.species` | string | Scientific name at species level | `Apis mellifera` |
-| `$filter.genus` | string | Genus name | `Apis` |
-| `$filter.family` | string | Family name | `Apidae` |
-| `$filter.country` | string | Country of collection | `Netherlands` |
-| `$filter.topicDiscipline` | string | Discipline filter | `Zoology`, `Botany` |
+| `physicalSpecimenId` | string | Exact match on physical specimen ID | `RMNH.INS.12345` |
+| `organisationName` | string | Institution name | `Naturalis Biodiversity Center` |
+| `collectionCode` | string | Collection code/acronym | `RMNH`, `ZMA` |
+| `species` | string | Scientific name at species level | `Apis mellifera` |
+| `genus` | string | Genus name | `Apis` |
+| `family` | string | Family name | `Apidae` |
+| `country` | string | Country of collection | `Netherlands` |
+| `topicDiscipline` | string | Discipline filter | `Zoology`, `Botany` |
+
+**Note**: For local identifiers (those unique only within a source system), append the source system ID suffix with a colon: `physicalSpecimenId=RMNH.INS.12345:source-system-id`
 
 ### 3.3 Pagination Parameters
 
@@ -129,7 +131,7 @@ Physical specimen IDs from collection management systems are the most reliable l
 GET /api/digital-specimen/v1/search?q=RMNH.INS.12345
 
 # Using structured filter (exact match)
-GET /api/digital-specimen/v1/search?$filter.physicalSpecimenId=RMNH.INS.12345
+GET /api/digital-specimen/v1/search?physicalSpecimenId=RMNH.INS.12345
 ```
 
 ### 4.3 Collection Code + Specimen Number
@@ -138,7 +140,7 @@ When BOLD stores collection code and specimen number separately:
 
 **Example** (Collection: RMNH, Number: 12345):
 ```http
-GET /api/digital-specimen/v1/search?$filter.collectionCode=RMNH&q=12345
+GET /api/digital-specimen/v1/search?collectionCode=RMNH&q=12345
 ```
 
 ### 4.4 Taxonomic + Geographic Filters
@@ -146,7 +148,7 @@ GET /api/digital-specimen/v1/search?$filter.collectionCode=RMNH&q=12345
 For broader searches when exact identifiers aren't available:
 
 ```http
-GET /api/digital-specimen/v1/search?$filter.species=Apis%20mellifera&$filter.country=Netherlands&pageSize=50
+GET /api/digital-specimen/v1/search?species=Apis%20mellifera&country=Netherlands&pageSize=50
 ```
 
 ---
@@ -350,11 +352,11 @@ def proxy_disscover_search():
     if request.args.get('q'):
         disscover_params['q'] = request.args.get('q')
     if request.args.get('physicalSpecimenId'):
-        disscover_params['$filter.physicalSpecimenId'] = request.args.get('physicalSpecimenId')
+        disscover_params['physicalSpecimenId'] = request.args.get('physicalSpecimenId')
     if request.args.get('collectionCode'):
-        disscover_params['$filter.collectionCode'] = request.args.get('collectionCode')
+        disscover_params['collectionCode'] = request.args.get('collectionCode')
     if request.args.get('species'):
-        disscover_params['$filter.species'] = request.args.get('species')
+        disscover_params['species'] = request.args.get('species')
     
     # Pagination
     disscover_params['pageSize'] = request.args.get('pageSize', '10')
@@ -464,13 +466,13 @@ app.get('/api/v1/external/disscover/search', async (req, res) => {
     disscover_params.append('q', req.query.q);
   }
   if (req.query.physicalSpecimenId) {
-    disscover_params.append('$filter.physicalSpecimenId', req.query.physicalSpecimenId);
+    disscover_params.append('physicalSpecimenId', req.query.physicalSpecimenId);
   }
   if (req.query.collectionCode) {
-    disscover_params.append('$filter.collectionCode', req.query.collectionCode);
+    disscover_params.append('collectionCode', req.query.collectionCode);
   }
   if (req.query.species) {
-    disscover_params.append('$filter.species', req.query.species);
+    disscover_params.append('species', req.query.species);
   }
   
   disscover_params.append('pageSize', req.query.pageSize || '10');
@@ -576,13 +578,13 @@ class DiSSCoverProxyController {
             $params['q'] = $_GET['q'];
         }
         if (!empty($_GET['physicalSpecimenId'])) {
-            $params['$filter.physicalSpecimenId'] = $_GET['physicalSpecimenId'];
+            $params['physicalSpecimenId'] = $_GET['physicalSpecimenId'];
         }
         if (!empty($_GET['collectionCode'])) {
-            $params['$filter.collectionCode'] = $_GET['collectionCode'];
+            $params['collectionCode'] = $_GET['collectionCode'];
         }
         if (!empty($_GET['species'])) {
-            $params['$filter.species'] = $_GET['species'];
+            $params['species'] = $_GET['species'];
         }
         
         $params['pageSize'] = $_GET['pageSize'] ?? '10';
