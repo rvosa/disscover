@@ -11,18 +11,28 @@ This document provides a complete technical specification for implementing DiSSC
 ### What This Integration Does
 When a user views a specimen record in BOLD, the system queries DiSSCover to check if a corresponding Digital Specimen exists. If found, BOLD displays a panel showing the DiSSCover DOI, specimen metadata, and direct links to the DiSSCover interface.
 
-### Architecture Summary
+### Architecture Summary (Backend Proxy Pattern)
+
+This integration uses BOLD's backend as a proxy to DiSSCover's API, avoiding any browser CORS restrictions:
+
 ```
-┌──────────────────┐         HTTPS GET          ┌──────────────────┐
-│                  │ ─────────────────────────► │                  │
-│   BOLD Frontend  │                            │  DiSSCover API   │
-│   (JavaScript)   │ ◄───────────────────────── │  (REST/JSON)     │
-│                  │         JSON Response      │                  │
-└──────────────────┘                            └──────────────────┘
+┌──────────────────┐                    ┌──────────────────┐                    ┌──────────────────┐
+│                  │    AJAX Request    │                  │    HTTPS GET       │                  │
+│   BOLD Frontend  │ ─────────────────► │   BOLD Backend   │ ─────────────────► │  DiSSCover API   │
+│   (JavaScript)   │                    │   (Proxy)        │                    │  (REST/JSON)     │
+│                  │ ◄───────────────── │                  │ ◄───────────────── │                  │
+│                  │    JSON Response   │                  │    JSON Response   │                  │
+└──────────────────┘                    └──────────────────┘                    └──────────────────┘
 ```
 
+**Why Use a Backend Proxy?**
+- No CORS configuration required from DiSSCo
+- BOLD maintains full control over the integration
+- Enables request caching, rate limiting, and logging on BOLD's side
+- Allows adding business logic (e.g., identifier transformation) in the proxy
+
 ### No Authentication Required
-DiSSCover's search API is public and read-only. No API keys, OAuth tokens, or authentication headers are required for this integration.
+DiSSCover's search API is public and read-only. No API keys, OAuth tokens, or authentication headers are required for the proxy to call DiSSCover.
 
 ---
 
@@ -274,61 +284,440 @@ Extract these fields from `data[].attributes` for display in BOLD:
 
 ---
 
-## 7. CORS Configuration Request
+## 7. Backend Proxy Implementation
 
-For BOLD's JavaScript frontend to call DiSSCover directly, CORS headers must permit the BOLD domain.
+BOLD should implement a backend proxy endpoint that forwards requests to DiSSCover. This approach requires no coordination with the DiSSCo team and gives BOLD full control over the integration.
 
-### Request to DiSSCo Team
+### 7.1 Proxy Endpoint Design
 
-Send this request to `support@dissco.eu`:
-
+**BOLD Internal Endpoint**:
 ```
-Subject: CORS Access Request for BOLD Systems Integration
-
-Dear DiSSCo Team,
-
-We are implementing DiSSCover specimen lookup functionality in BOLD Systems 
-(boldsystems.org). Please add the following origins to your CORS allowed origins:
-
-Production:
-- https://boldsystems.org
-- https://www.boldsystems.org
-
-Development/Testing:
-- https://dev.boldsystems.org
-- https://staging.boldsystems.org
-
-The integration will use read-only GET requests to:
-- /api/digital-specimen/v1/search
-
-No authentication or write access is required.
-
-Best regards,
-[BOLD Development Team]
+GET /api/v1/external/disscover/search
 ```
 
-### Alternative: Server-Side Proxy
+**Query Parameters** (passed through to DiSSCover):
 
-If CORS cannot be configured, BOLD can proxy requests through its backend:
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `q` | Free-text search query | `BOLD:AAA1234-21` |
+| `physicalSpecimenId` | Exact specimen ID match | `RMNH.INS.12345` |
+| `collectionCode` | Collection code filter | `RMNH` |
+| `species` | Species name filter | `Apis mellifera` |
+| `pageSize` | Results per page (default 10) | `25` |
+| `pageNumber` | Page number | `1` |
 
-```
-BOLD Frontend → BOLD Backend Proxy → DiSSCover API
+### 7.2 Proxy Implementation Examples
+
+#### Python/Flask Backend Proxy
+
+```python
+from flask import Flask, request, jsonify
+import requests
+from functools import lru_cache
+import time
+
+app = Flask(__name__)
+
+DISSCOVER_API_BASE = "https://dev.dissco.tech/api"
+CACHE_TTL_SECONDS = 3600  # Cache responses for 1 hour
+
+# Simple time-based cache
+_cache = {}
+
+def get_cached(key, ttl=CACHE_TTL_SECONDS):
+    """Get value from cache if not expired."""
+    if key in _cache:
+        value, timestamp = _cache[key]
+        if time.time() - timestamp < ttl:
+            return value
+    return None
+
+def set_cached(key, value):
+    """Store value in cache with timestamp."""
+    _cache[key] = (value, time.time())
+
+@app.route('/api/v1/external/disscover/search', methods=['GET'])
+def proxy_disscover_search():
+    """
+    Proxy endpoint for DiSSCover specimen search.
+    
+    Forwards requests to DiSSCover API and caches responses.
+    """
+    # Build query parameters for DiSSCover
+    disscover_params = {}
+    
+    # Map BOLD parameters to DiSSCover parameters
+    if request.args.get('q'):
+        disscover_params['q'] = request.args.get('q')
+    if request.args.get('physicalSpecimenId'):
+        disscover_params['$filter.physicalSpecimenId'] = request.args.get('physicalSpecimenId')
+    if request.args.get('collectionCode'):
+        disscover_params['$filter.collectionCode'] = request.args.get('collectionCode')
+    if request.args.get('species'):
+        disscover_params['$filter.species'] = request.args.get('species')
+    
+    # Pagination
+    disscover_params['pageSize'] = request.args.get('pageSize', '10')
+    disscover_params['pageNumber'] = request.args.get('pageNumber', '1')
+    
+    # Create cache key from parameters
+    cache_key = str(sorted(disscover_params.items()))
+    
+    # Check cache first
+    cached_response = get_cached(cache_key)
+    if cached_response:
+        return jsonify(cached_response)
+    
+    # Make request to DiSSCover
+    try:
+        disscover_url = f"{DISSCOVER_API_BASE}/digital-specimen/v1/search"
+        response = requests.get(
+            disscover_url,
+            params=disscover_params,
+            timeout=30,
+            headers={'Accept': 'application/json'}
+        )
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        # Cache successful response
+        set_cached(cache_key, data)
+        
+        return jsonify(data)
+        
+    except requests.Timeout:
+        return jsonify({
+            'error': 'DiSSCover API timeout',
+            'data': [],
+            'meta': {'totalRecords': 0}
+        }), 504
+        
+    except requests.RequestException as e:
+        return jsonify({
+            'error': f'DiSSCover API error: {str(e)}',
+            'data': [],
+            'meta': {'totalRecords': 0}
+        }), 502
+
+# Convenience endpoint for BOLD Process ID lookup
+@app.route('/api/v1/external/disscover/lookup/<process_id>', methods=['GET'])
+def lookup_by_process_id(process_id):
+    """
+    Convenience endpoint to look up a specimen by BOLD Process ID.
+    Tries multiple search strategies.
+    """
+    strategies = [
+        f"BOLD:{process_id}",  # With BOLD: prefix
+        process_id,            # Raw process ID
+    ]
+    
+    for query in strategies:
+        cache_key = f"lookup:{query}"
+        cached = get_cached(cache_key)
+        if cached and cached.get('data'):
+            return jsonify(cached)
+        
+        try:
+            response = requests.get(
+                f"{DISSCOVER_API_BASE}/digital-specimen/v1/search",
+                params={'q': query, 'pageSize': '5'},
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get('data'):
+                set_cached(cache_key, data)
+                return jsonify(data)
+                
+        except requests.RequestException:
+            continue
+    
+    return jsonify({
+        'data': [],
+        'meta': {'totalRecords': 0},
+        'message': 'No matching specimen found in DiSSCover'
+    })
 ```
 
-**BOLD Backend Proxy Endpoint Example**:
-```
-GET /api/v1/external/disscover/search?q={query}
+#### Node.js/Express Backend Proxy
+
+```javascript
+const express = require('express');
+const axios = require('axios');
+const NodeCache = require('node-cache');
+
+const app = express();
+const cache = new NodeCache({ stdTTL: 3600 }); // 1 hour TTL
+
+const DISSCOVER_API_BASE = 'https://dev.dissco.tech/api';
+
+/**
+ * Proxy endpoint for DiSSCover specimen search
+ */
+app.get('/api/v1/external/disscover/search', async (req, res) => {
+  // Build DiSSCover query parameters
+  const disscover_params = new URLSearchParams();
+  
+  if (req.query.q) {
+    disscover_params.append('q', req.query.q);
+  }
+  if (req.query.physicalSpecimenId) {
+    disscover_params.append('$filter.physicalSpecimenId', req.query.physicalSpecimenId);
+  }
+  if (req.query.collectionCode) {
+    disscover_params.append('$filter.collectionCode', req.query.collectionCode);
+  }
+  if (req.query.species) {
+    disscover_params.append('$filter.species', req.query.species);
+  }
+  
+  disscover_params.append('pageSize', req.query.pageSize || '10');
+  disscover_params.append('pageNumber', req.query.pageNumber || '1');
+  
+  // Check cache
+  const cacheKey = disscover_params.toString();
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
+  
+  try {
+    const response = await axios.get(
+      `${DISSCOVER_API_BASE}/digital-specimen/v1/search`,
+      {
+        params: Object.fromEntries(disscover_params),
+        timeout: 30000,
+        headers: { 'Accept': 'application/json' }
+      }
+    );
+    
+    // Cache and return
+    cache.set(cacheKey, response.data);
+    res.json(response.data);
+    
+  } catch (error) {
+    console.error('DiSSCover proxy error:', error.message);
+    res.status(502).json({
+      error: 'DiSSCover API error',
+      data: [],
+      meta: { totalRecords: 0 }
+    });
+  }
+});
+
+/**
+ * Convenience endpoint for BOLD Process ID lookup
+ */
+app.get('/api/v1/external/disscover/lookup/:processId', async (req, res) => {
+  const { processId } = req.params;
+  const strategies = [`BOLD:${processId}`, processId];
+  
+  for (const query of strategies) {
+    const cacheKey = `lookup:${query}`;
+    const cached = cache.get(cacheKey);
+    if (cached?.data?.length > 0) {
+      return res.json(cached);
+    }
+    
+    try {
+      const response = await axios.get(
+        `${DISSCOVER_API_BASE}/digital-specimen/v1/search`,
+        {
+          params: { q: query, pageSize: 5 },
+          timeout: 30000
+        }
+      );
+      
+      if (response.data?.data?.length > 0) {
+        cache.set(cacheKey, response.data);
+        return res.json(response.data);
+      }
+    } catch (error) {
+      continue;
+    }
+  }
+  
+  res.json({
+    data: [],
+    meta: { totalRecords: 0 },
+    message: 'No matching specimen found in DiSSCover'
+  });
+});
+
+module.exports = app;
 ```
 
-The proxy simply forwards the request to DiSSCover and returns the response.
+#### PHP Backend Proxy
+
+```php
+<?php
+/**
+ * DiSSCover Proxy Controller for BOLD
+ * 
+ * Add this to your BOLD backend routing.
+ */
+
+class DiSSCoverProxyController {
+    
+    private const DISSCOVER_API_BASE = 'https://dev.dissco.tech/api';
+    private const CACHE_TTL = 3600; // 1 hour
+    
+    /**
+     * Proxy search requests to DiSSCover
+     * Route: GET /api/v1/external/disscover/search
+     */
+    public function search() {
+        // Build DiSSCover parameters
+        $params = [];
+        
+        if (!empty($_GET['q'])) {
+            $params['q'] = $_GET['q'];
+        }
+        if (!empty($_GET['physicalSpecimenId'])) {
+            $params['$filter.physicalSpecimenId'] = $_GET['physicalSpecimenId'];
+        }
+        if (!empty($_GET['collectionCode'])) {
+            $params['$filter.collectionCode'] = $_GET['collectionCode'];
+        }
+        if (!empty($_GET['species'])) {
+            $params['$filter.species'] = $_GET['species'];
+        }
+        
+        $params['pageSize'] = $_GET['pageSize'] ?? '10';
+        $params['pageNumber'] = $_GET['pageNumber'] ?? '1';
+        
+        // Check cache
+        $cacheKey = 'disscover_' . md5(serialize($params));
+        $cached = $this->getFromCache($cacheKey);
+        if ($cached !== null) {
+            return $this->jsonResponse($cached);
+        }
+        
+        // Make request to DiSSCover
+        $url = self::DISSCOVER_API_BASE . '/digital-specimen/v1/search?' . http_build_query($params);
+        
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $url,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 30,
+            CURLOPT_HTTPHEADER => ['Accept: application/json']
+        ]);
+        
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
+        curl_close($ch);
+        
+        if ($error || $httpCode !== 200) {
+            return $this->jsonResponse([
+                'error' => 'DiSSCover API error',
+                'data' => [],
+                'meta' => ['totalRecords' => 0]
+            ], 502);
+        }
+        
+        $data = json_decode($response, true);
+        
+        // Cache successful response
+        $this->setCache($cacheKey, $data, self::CACHE_TTL);
+        
+        return $this->jsonResponse($data);
+    }
+    
+    /**
+     * Convenience lookup by BOLD Process ID
+     * Route: GET /api/v1/external/disscover/lookup/{processId}
+     */
+    public function lookupByProcessId($processId) {
+        $strategies = ["BOLD:$processId", $processId];
+        
+        foreach ($strategies as $query) {
+            $cacheKey = 'disscover_lookup_' . md5($query);
+            $cached = $this->getFromCache($cacheKey);
+            
+            if ($cached !== null && !empty($cached['data'])) {
+                return $this->jsonResponse($cached);
+            }
+            
+            $url = self::DISSCOVER_API_BASE . '/digital-specimen/v1/search?' . 
+                   http_build_query(['q' => $query, 'pageSize' => 5]);
+            
+            $ch = curl_init();
+            curl_setopt_array($ch, [
+                CURLOPT_URL => $url,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => 30
+            ]);
+            
+            $response = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            
+            if ($httpCode === 200) {
+                $data = json_decode($response, true);
+                if (!empty($data['data'])) {
+                    $this->setCache($cacheKey, $data, self::CACHE_TTL);
+                    return $this->jsonResponse($data);
+                }
+            }
+        }
+        
+        return $this->jsonResponse([
+            'data' => [],
+            'meta' => ['totalRecords' => 0],
+            'message' => 'No matching specimen found in DiSSCover'
+        ]);
+    }
+    
+    // Cache helpers (implement with your caching system: Redis, Memcached, etc.)
+    private function getFromCache($key) {
+        // Example using APCu:
+        // return apcu_fetch($key) ?: null;
+        return null; // Replace with your cache implementation
+    }
+    
+    private function setCache($key, $value, $ttl) {
+        // Example using APCu:
+        // apcu_store($key, $value, $ttl);
+    }
+    
+    private function jsonResponse($data, $status = 200) {
+        http_response_code($status);
+        header('Content-Type: application/json');
+        echo json_encode($data);
+        exit;
+    }
+}
+```
+
+### 7.3 Proxy Benefits
+
+| Benefit | Description |
+|---------|-------------|
+| **No External Dependencies** | No need to request CORS changes from DiSSCo |
+| **Caching** | Reduce load on DiSSCover by caching responses |
+| **Rate Limiting** | Implement your own rate limits to protect DiSSCover |
+| **Logging** | Track DiSSCover usage patterns in your own logs |
+| **Error Handling** | Customize error responses for your frontend |
+| **Identifier Transformation** | Add logic to transform BOLD IDs before querying |
 
 ---
 
-## 8. Implementation Code Examples
+## 8. Frontend Code Examples
 
-### 8.1 JavaScript/TypeScript (Frontend)
+### 8.1 JavaScript/TypeScript (Calling BOLD's Proxy)
 
 ```typescript
+/**
+ * DiSSCover Integration for BOLD Frontend
+ * 
+ * This code calls BOLD's backend proxy (not DiSSCover directly).
+ * No CORS configuration is required.
+ */
+
 interface DiSSCoverSpecimen {
   "@id": string;
   "dcterms:identifier": string;
@@ -348,6 +737,8 @@ interface DiSSCoverResponse {
   meta: {
     totalRecords: number;
   };
+  error?: string;
+  message?: string;
 }
 
 interface DiSSCoverLookupResult {
@@ -358,16 +749,18 @@ interface DiSSCoverLookupResult {
   error?: string;
 }
 
-const DISSCOVER_BASE_URL = 'https://dev.dissco.tech/api';
+// Use BOLD's own backend proxy - no CORS issues
+const BOLD_DISSCOVER_PROXY = '/api/v1/external/disscover';
 
 /**
- * Search DiSSCover for a specimen matching the given identifier
- * @param identifier - BOLD Process ID, catalog number, or other specimen identifier
+ * Look up a specimen in DiSSCover using BOLD's backend proxy.
+ * Uses the convenience endpoint that tries multiple search strategies.
+ * 
+ * @param processId - BOLD Process ID (e.g., "AAA1234-21")
  * @returns Lookup result with specimen data if found
  */
-async function searchDiSSCover(identifier: string): Promise<DiSSCoverLookupResult> {
-  const encodedQuery = encodeURIComponent(identifier);
-  const url = `${DISSCOVER_BASE_URL}/digital-specimen/v1/search?q=${encodedQuery}&pageSize=10`;
+async function lookupByProcessId(processId: string): Promise<DiSSCoverLookupResult> {
+  const url = `${BOLD_DISSCOVER_PROXY}/lookup/${encodeURIComponent(processId)}`;
   
   try {
     const response = await fetch(url, {
@@ -386,7 +779,7 @@ async function searchDiSSCover(identifier: string): Promise<DiSSCoverLookupResul
     
     const data: DiSSCoverResponse = await response.json();
     
-    if (data.data.length === 0) {
+    if (!data.data || data.data.length === 0) {
       return { found: false };
     }
     
@@ -398,7 +791,7 @@ async function searchDiSSCover(identifier: string): Promise<DiSSCoverLookupResul
       found: true,
       specimen,
       doi,
-      url: specimen["@id"]  // This is the clickable URL
+      url: specimen["@id"]  // This is the clickable URL to DiSSCover
     };
     
   } catch (error) {
@@ -410,52 +803,50 @@ async function searchDiSSCover(identifier: string): Promise<DiSSCoverLookupResul
 }
 
 /**
- * Search using multiple identifier strategies
- * Tries BOLD Process ID format first, then raw identifier
+ * Search DiSSCover using BOLD's proxy with custom parameters.
+ * 
+ * @param params - Search parameters
+ * @returns DiSSCover response
  */
-async function findDiSSCoverSpecimen(
-  boldProcessId?: string,
-  catalogNumber?: string,
-  collectionCode?: string
-): Promise<DiSSCoverLookupResult> {
+async function searchDiSSCover(params: {
+  q?: string;
+  physicalSpecimenId?: string;
+  collectionCode?: string;
+  species?: string;
+  pageSize?: number;
+}): Promise<DiSSCoverResponse> {
+  const searchParams = new URLSearchParams();
   
-  // Strategy 1: Try BOLD Process ID with prefix
-  if (boldProcessId) {
-    const result = await searchDiSSCover(`BOLD:${boldProcessId}`);
-    if (result.found) return result;
-    
-    // Try without prefix
-    const result2 = await searchDiSSCover(boldProcessId);
-    if (result2.found) return result2;
-  }
+  if (params.q) searchParams.append('q', params.q);
+  if (params.physicalSpecimenId) searchParams.append('physicalSpecimenId', params.physicalSpecimenId);
+  if (params.collectionCode) searchParams.append('collectionCode', params.collectionCode);
+  if (params.species) searchParams.append('species', params.species);
+  if (params.pageSize) searchParams.append('pageSize', String(params.pageSize));
   
-  // Strategy 2: Try catalog number
-  if (catalogNumber) {
-    const result = await searchDiSSCover(catalogNumber);
-    if (result.found) return result;
-  }
+  const url = `${BOLD_DISSCOVER_PROXY}/search?${searchParams.toString()}`;
   
-  // Strategy 3: Try collection code + catalog number combined
-  if (collectionCode && catalogNumber) {
-    const combined = `${collectionCode}.${catalogNumber}`;
-    const result = await searchDiSSCover(combined);
-    if (result.found) return result;
-  }
-  
-  return { found: false };
+  const response = await fetch(url);
+  return response.json();
 }
 
-// Example usage in BOLD specimen view component
+/**
+ * Example: Load DiSSCover panel data for a specimen view
+ */
 async function loadDiSSCoverPanel(specimenData: {
   processId: string;
   catalogNum?: string;
   institution?: string;
-}) {
-  const result = await findDiSSCoverSpecimen(
-    specimenData.processId,
-    specimenData.catalogNum,
-    specimenData.institution
-  );
+}): Promise<{
+  show: boolean;
+  doi?: string;
+  url?: string;
+  midsLevel?: number;
+  specimenName?: string;
+  organisation?: string;
+  hasMedia?: boolean;
+}> {
+  // Primary strategy: lookup by process ID (proxy handles fallback strategies)
+  const result = await lookupByProcessId(specimenData.processId);
   
   if (result.found && result.specimen) {
     return {
@@ -469,200 +860,238 @@ async function loadDiSSCoverPanel(specimenData: {
     };
   }
   
+  // Fallback: try catalog number if process ID didn't match
+  if (specimenData.catalogNum) {
+    const searchResult = await searchDiSSCover({
+      q: specimenData.catalogNum,
+      pageSize: 5
+    });
+    
+    if (searchResult.data?.length > 0) {
+      const specimen = searchResult.data[0].attributes;
+      return {
+        show: true,
+        doi: specimen["dcterms:identifier"],
+        url: specimen["@id"],
+        midsLevel: specimen["ods:midsLevel"],
+        specimenName: specimen["ods:specimenName"],
+        organisation: specimen["ods:organisationName"],
+        hasMedia: specimen["ods:isKnownToContainMedia"] ?? false
+      };
+    }
+  }
+  
   return { show: false };
+}
+
+// React component example
+function DiSSCoverPanel({ processId, catalogNum, institution }: {
+  processId: string;
+  catalogNum?: string;
+  institution?: string;
+}) {
+  const [panelData, setPanelData] = React.useState<{
+    loading: boolean;
+    show: boolean;
+    doi?: string;
+    url?: string;
+    midsLevel?: number;
+    specimenName?: string;
+    organisation?: string;
+    hasMedia?: boolean;
+    error?: string;
+  }>({ loading: true, show: false });
+  
+  React.useEffect(() => {
+    loadDiSSCoverPanel({ processId, catalogNum, institution })
+      .then(result => setPanelData({ ...result, loading: false }))
+      .catch(error => setPanelData({ 
+        loading: false, 
+        show: false, 
+        error: error.message 
+      }));
+  }, [processId, catalogNum, institution]);
+  
+  if (panelData.loading) {
+    return <div className="disscover-panel loading">Checking DiSSCover...</div>;
+  }
+  
+  if (!panelData.show) {
+    return (
+      <div className="disscover-panel not-found">
+        <p>No Digital Specimen found in DiSSCover</p>
+        <a href={`https://dev.dissco.tech/search?q=${encodeURIComponent(processId)}`} 
+           target="_blank" rel="noopener noreferrer">
+          Search DiSSCover manually
+        </a>
+      </div>
+    );
+  }
+  
+  return (
+    <div className="disscover-panel found">
+      <h4>✓ Digital Specimen Found</h4>
+      <p><strong>DOI:</strong> {panelData.doi}</p>
+      <p><strong>MIDS Level:</strong> {panelData.midsLevel}/3</p>
+      {panelData.specimenName && <p><strong>Name:</strong> {panelData.specimenName}</p>}
+      {panelData.organisation && <p><strong>Institution:</strong> {panelData.organisation}</p>}
+      {panelData.hasMedia && <p>📷 Media available</p>}
+      <a href={panelData.url} target="_blank" rel="noopener noreferrer" className="btn">
+        View in DiSSCover
+      </a>
+    </div>
+  );
 }
 ```
 
-### 8.2 Python (Backend Proxy or Batch Processing)
+### 8.2 Python (Batch Processing)
+
+Use this for batch processing large numbers of BOLD specimens to find DiSSCover matches:
 
 ```python
+"""
+Batch DiSSCover lookup for BOLD specimens.
+This script can be run as a scheduled job to pre-populate DiSSCover links.
+"""
 import requests
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
-from urllib.parse import urlencode, quote
+import csv
+import time
 
-DISSCOVER_BASE_URL = "https://dev.dissco.tech/api"
+# Use your BOLD backend proxy, or DiSSCover directly for batch jobs
+DISSCOVER_API = "https://dev.dissco.tech/api"
 
 @dataclass
-class DiSSCoverSpecimen:
-    doi: str
-    url: str
-    mids_level: int
-    specimen_name: Optional[str]
-    organisation_name: Optional[str]
-    organisation_code: Optional[str]
-    has_media: bool
-    raw_data: Dict[str, Any]
-
-@dataclass  
-class LookupResult:
+class DiSSCoverMatch:
+    bold_process_id: str
     found: bool
-    specimen: Optional[DiSSCoverSpecimen] = None
+    doi: Optional[str] = None
+    url: Optional[str] = None
+    specimen_name: Optional[str] = None
+    organisation: Optional[str] = None
+    mids_level: Optional[int] = None
     error: Optional[str] = None
 
-def search_disscover(query: str, page_size: int = 10) -> LookupResult:
-    """
-    Search DiSSCover for specimens matching the query.
+def lookup_single(process_id: str) -> DiSSCoverMatch:
+    """Look up a single BOLD Process ID in DiSSCover."""
+    strategies = [f"BOLD:{process_id}", process_id]
     
-    Args:
-        query: Search string (BOLD Process ID, catalog number, etc.)
-        page_size: Maximum results to return
-        
-    Returns:
-        LookupResult with specimen data if found
-    """
-    url = f"{DISSCOVER_BASE_URL}/digital-specimen/v1/search"
-    params = {
-        "q": query,
-        "pageSize": page_size
-    }
+    for query in strategies:
+        try:
+            response = requests.get(
+                f"{DISSCOVER_API}/digital-specimen/v1/search",
+                params={"q": query, "pageSize": 5},
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("data"):
+                attrs = data["data"][0]["attributes"]
+                return DiSSCoverMatch(
+                    bold_process_id=process_id,
+                    found=True,
+                    doi=attrs.get("dcterms:identifier"),
+                    url=attrs.get("@id"),
+                    specimen_name=attrs.get("ods:specimenName"),
+                    organisation=attrs.get("ods:organisationName"),
+                    mids_level=attrs.get("ods:midsLevel")
+                )
+        except requests.RequestException as e:
+            continue
     
-    try:
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        
-        if not data.get("data"):
-            return LookupResult(found=False)
-        
-        # Get first match
-        attrs = data["data"][0]["attributes"]
-        
-        specimen = DiSSCoverSpecimen(
-            doi=attrs.get("dcterms:identifier", ""),
-            url=attrs.get("@id", ""),
-            mids_level=attrs.get("ods:midsLevel", 0),
-            specimen_name=attrs.get("ods:specimenName"),
-            organisation_name=attrs.get("ods:organisationName"),
-            organisation_code=attrs.get("ods:organisationCode"),
-            has_media=attrs.get("ods:isKnownToContainMedia", False),
-            raw_data=attrs
-        )
-        
-        return LookupResult(found=True, specimen=specimen)
-        
-    except requests.RequestException as e:
-        return LookupResult(found=False, error=str(e))
+    return DiSSCoverMatch(bold_process_id=process_id, found=False)
 
-def find_disscover_specimen(
-    bold_process_id: Optional[str] = None,
-    catalog_number: Optional[str] = None,
-    collection_code: Optional[str] = None
-) -> LookupResult:
+def batch_lookup(process_ids: List[str], delay: float = 0.5) -> List[DiSSCoverMatch]:
     """
-    Search for a DiSSCover specimen using multiple identifier strategies.
+    Batch lookup for multiple BOLD Process IDs.
+    Includes rate limiting to be respectful to DiSSCover API.
+    """
+    results = []
+    total = len(process_ids)
     
-    Args:
-        bold_process_id: BOLD Process ID (e.g., "AAA1234-21")
-        catalog_number: Institution catalog number
-        collection_code: Collection/institution code
+    for i, pid in enumerate(process_ids, 1):
+        result = lookup_single(pid)
+        results.append(result)
         
-    Returns:
-        LookupResult with first matching specimen
-    """
-    # Strategy 1: BOLD Process ID with prefix
-    if bold_process_id:
-        result = search_disscover(f"BOLD:{bold_process_id}")
         if result.found:
-            return result
+            print(f"[{i}/{total}] ✓ {pid} → {result.doi}")
+        else:
+            print(f"[{i}/{total}] ✗ {pid} not found")
         
-        # Try without prefix
-        result = search_disscover(bold_process_id)
-        if result.found:
-            return result
+        # Rate limiting
+        if i < total:
+            time.sleep(delay)
     
-    # Strategy 2: Catalog number
-    if catalog_number:
-        result = search_disscover(catalog_number)
-        if result.found:
-            return result
-    
-    # Strategy 3: Combined collection code + catalog number
-    if collection_code and catalog_number:
-        combined = f"{collection_code}.{catalog_number}"
-        result = search_disscover(combined)
-        if result.found:
-            return result
-    
-    return LookupResult(found=False)
-
-# Batch processing example
-def batch_lookup_specimens(identifiers: List[str]) -> Dict[str, LookupResult]:
-    """
-    Look up multiple specimens in DiSSCover.
-    
-    Args:
-        identifiers: List of specimen identifiers to look up
-        
-    Returns:
-        Dictionary mapping identifiers to their lookup results
-    """
-    results = {}
-    for identifier in identifiers:
-        results[identifier] = search_disscover(identifier)
     return results
+
+def export_results_csv(results: List[DiSSCoverMatch], filename: str):
+    """Export batch results to CSV."""
+    with open(filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'bold_process_id', 'found', 'disscover_doi', 
+            'disscover_url', 'specimen_name', 'organisation', 'mids_level'
+        ])
+        for r in results:
+            writer.writerow([
+                r.bold_process_id, r.found, r.doi or '',
+                r.url or '', r.specimen_name or '', 
+                r.organisation or '', r.mids_level or ''
+            ])
 
 # Example usage
 if __name__ == "__main__":
-    # Single lookup
-    result = find_disscover_specimen(
-        bold_process_id="AAA1234-21",
-        catalog_number="RMNH.INS.12345",
-        collection_code="RMNH"
-    )
+    # List of BOLD Process IDs to look up
+    process_ids = [
+        "AAA1234-21",
+        "BBB5678-22",
+        "CCC9012-23",
+        # ... add more
+    ]
     
-    if result.found:
-        print(f"Found: {result.specimen.doi}")
-        print(f"  Name: {result.specimen.specimen_name}")
-        print(f"  MIDS Level: {result.specimen.mids_level}")
-        print(f"  Institution: {result.specimen.organisation_name}")
-        print(f"  Has Media: {result.specimen.has_media}")
-        print(f"  URL: {result.specimen.url}")
-    else:
-        print(f"Not found. Error: {result.error}")
+    print(f"Looking up {len(process_ids)} specimens in DiSSCover...")
+    results = batch_lookup(process_ids, delay=0.5)
+    
+    found_count = sum(1 for r in results if r.found)
+    print(f"\nResults: {found_count}/{len(results)} found in DiSSCover")
+    
+    # Export to CSV
+    export_results_csv(results, "disscover_matches.csv")
+    print(f"Results exported to disscover_matches.csv")
 ```
 
-### 8.3 PHP (WordPress/Legacy Integration)
+### 8.3 PHP (Frontend Helper)
+
+This is a simple PHP helper class for calling BOLD's proxy from PHP templates:
 
 ```php
 <?php
-
-class DiSSCoverClient {
-    private const BASE_URL = 'https://dev.dissco.tech/api';
-    private const TIMEOUT = 30;
+/**
+ * DiSSCover lookup helper for BOLD PHP templates.
+ * Calls BOLD's internal proxy endpoint.
+ */
+class DiSSCoverLookup {
+    
+    private string $proxyBaseUrl;
+    
+    public function __construct(string $proxyBaseUrl = '/api/v1/external/disscover') {
+        $this->proxyBaseUrl = $proxyBaseUrl;
+    }
     
     /**
-     * Search DiSSCover for specimens
+     * Look up a specimen by BOLD Process ID
      * 
-     * @param string $query Search query
-     * @param int $pageSize Max results
-     * @return array{found: bool, specimen?: array, error?: string}
+     * @param string $processId BOLD Process ID (e.g., "AAA1234-21")
+     * @return array{found: bool, doi?: string, url?: string, specimenName?: string, organisation?: string, midsLevel?: int, hasMedia?: bool}
      */
-    public function search(string $query, int $pageSize = 10): array {
-        $url = self::BASE_URL . '/digital-specimen/v1/search?' . http_build_query([
-            'q' => $query,
-            'pageSize' => $pageSize
-        ]);
+    public function lookup(string $processId): array {
+        $url = $this->proxyBaseUrl . '/lookup/' . urlencode($processId);
         
-        $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_URL => $url,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => self::TIMEOUT,
-            CURLOPT_HTTPHEADER => ['Accept: application/json']
-        ]);
-        
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error = curl_error($ch);
-        curl_close($ch);
-        
-        if ($error) {
-            return ['found' => false, 'error' => $error];
-        }
-        
-        if ($httpCode !== 200) {
-            return ['found' => false, 'error' => "HTTP $httpCode"];
+        $response = file_get_contents($url);
+        if ($response === false) {
+            return ['found' => false, 'error' => 'Failed to contact proxy'];
         }
         
         $data = json_decode($response, true);
@@ -675,61 +1104,46 @@ class DiSSCoverClient {
         
         return [
             'found' => true,
-            'specimen' => [
-                'doi' => $attrs['dcterms:identifier'] ?? '',
-                'url' => $attrs['@id'] ?? '',
-                'midsLevel' => $attrs['ods:midsLevel'] ?? 0,
-                'specimenName' => $attrs['ods:specimenName'] ?? null,
-                'organisationName' => $attrs['ods:organisationName'] ?? null,
-                'hasMedia' => $attrs['ods:isKnownToContainMedia'] ?? false
-            ]
+            'doi' => $attrs['dcterms:identifier'] ?? '',
+            'url' => $attrs['@id'] ?? '',
+            'specimenName' => $attrs['ods:specimenName'] ?? null,
+            'organisation' => $attrs['ods:organisationName'] ?? null,
+            'midsLevel' => $attrs['ods:midsLevel'] ?? 0,
+            'hasMedia' => $attrs['ods:isKnownToContainMedia'] ?? false
         ];
     }
-    
-    /**
-     * Find specimen using multiple identifier strategies
-     */
-    public function findSpecimen(
-        ?string $boldProcessId = null,
-        ?string $catalogNumber = null,
-        ?string $collectionCode = null
-    ): array {
-        // Try BOLD Process ID
-        if ($boldProcessId) {
-            $result = $this->search("BOLD:$boldProcessId");
-            if ($result['found']) return $result;
-            
-            $result = $this->search($boldProcessId);
-            if ($result['found']) return $result;
-        }
-        
-        // Try catalog number
-        if ($catalogNumber) {
-            $result = $this->search($catalogNumber);
-            if ($result['found']) return $result;
-        }
-        
-        // Try combined
-        if ($collectionCode && $catalogNumber) {
-            $result = $this->search("$collectionCode.$catalogNumber");
-            if ($result['found']) return $result;
-        }
-        
-        return ['found' => false];
-    }
 }
 
-// Usage example
-$client = new DiSSCoverClient();
-$result = $client->findSpecimen(
-    boldProcessId: 'AAA1234-21',
-    catalogNumber: 'RMNH.INS.12345',
-    collectionCode: 'RMNH'
-);
+// Usage in a template
+$lookup = new DiSSCoverLookup();
+$result = $lookup->lookup($boldProcessId);
 
-if ($result['found']) {
-    echo "Found: " . $result['specimen']['doi'] . "\n";
-}
+if ($result['found']): ?>
+    <div class="disscover-panel found">
+        <h4>✓ Digital Specimen Found</h4>
+        <p><strong>DOI:</strong> <?= htmlspecialchars($result['doi']) ?></p>
+        <p><strong>MIDS Level:</strong> <?= $result['midsLevel'] ?>/3</p>
+        <?php if ($result['specimenName']): ?>
+            <p><strong>Name:</strong> <?= htmlspecialchars($result['specimenName']) ?></p>
+        <?php endif; ?>
+        <?php if ($result['organisation']): ?>
+            <p><strong>Institution:</strong> <?= htmlspecialchars($result['organisation']) ?></p>
+        <?php endif; ?>
+        <?php if ($result['hasMedia']): ?>
+            <p>📷 Media available</p>
+        <?php endif; ?>
+        <a href="<?= htmlspecialchars($result['url']) ?>" target="_blank" class="btn">
+            View in DiSSCover
+        </a>
+    </div>
+<?php else: ?>
+    <div class="disscover-panel not-found">
+        <p>No Digital Specimen found in DiSSCover</p>
+        <a href="https://dev.dissco.tech/search?q=<?= urlencode($boldProcessId) ?>" target="_blank">
+            Search DiSSCover manually
+        </a>
+    </div>
+<?php endif; ?>
 ```
 
 ---
@@ -840,17 +1254,18 @@ disscover:specimen:{identifier_hash}
 | Error | HTTP Status | BOLD Action |
 |-------|-------------|-------------|
 | Network timeout | - | Show "Service unavailable", offer retry |
+| Proxy error | 502 | Log error, show "DiSSCover temporarily unavailable" |
 | Rate limited | 429 | Back off, show "Please try again later" |
 | Server error | 500 | Log error, show generic message |
 | Invalid response | - | Log error, treat as "not found" |
-| CORS blocked | - | Fall back to proxy or hide panel |
 
 ### Rate Limiting
 
-DiSSCover does not currently impose strict rate limits, but BOLD should implement client-side throttling:
+DiSSCover does not currently impose strict rate limits, but BOLD should implement throttling in the proxy:
 
-- Maximum 10 requests per second per client
+- Maximum 10 requests per second to DiSSCover
 - Implement exponential backoff on errors
+- Use caching to reduce repeated requests
 - Batch queries where possible
 
 ---
@@ -859,12 +1274,14 @@ DiSSCover does not currently impose strict rate limits, but BOLD should implemen
 
 ### Functional Tests
 
+- [ ] Proxy endpoint is accessible at `/api/v1/external/disscover/search`
+- [ ] Lookup endpoint is accessible at `/api/v1/external/disscover/lookup/{processId}`
 - [ ] Search returns results for known DiSSCover specimens
 - [ ] Search returns empty for non-existent specimens
 - [ ] BOLD Process ID format is correctly URL-encoded
 - [ ] Catalog numbers with special characters work
-- [ ] Multiple search strategies are tried in order
-- [ ] Component displays all fields correctly
+- [ ] Multiple search strategies are tried in order by the proxy
+- [ ] Frontend component displays all fields correctly
 - [ ] Links to DiSSCover open correct pages
 - [ ] Copy DOI button works
 
@@ -878,7 +1295,8 @@ DiSSCover does not currently impose strict rate limits, but BOLD should implemen
 
 ### Performance Tests
 
-- [ ] API response time < 2 seconds
+- [ ] Proxy response time < 3 seconds (including DiSSCover call)
+- [ ] Cached responses return < 100ms
 - [ ] Component renders within 100ms of data receipt
 - [ ] Caching reduces redundant API calls
 - [ ] Page load not blocked by DiSSCover lookup
@@ -886,9 +1304,9 @@ DiSSCover does not currently impose strict rate limits, but BOLD should implemen
 ### Error Handling Tests
 
 - [ ] Network timeout shows appropriate message
-- [ ] HTTP errors are caught and displayed
+- [ ] Proxy errors (502) display user-friendly message
 - [ ] Invalid JSON responses don't crash component
-- [ ] CORS errors are handled gracefully
+- [ ] Failed requests can be retried
 
 ---
 
@@ -925,13 +1343,12 @@ ods:hasIdentifiers[]          → All linked identifiers
 | Topic | Contact |
 |-------|---------|
 | DiSSCover API issues | support@dissco.eu |
-| CORS access requests | support@dissco.eu |
 | API documentation | https://dev.dissco.tech/api-docs |
 | Schema documentation | https://schemas.dissco.tech |
 | DiSSCover user guide | https://dev.dissco.tech/about |
 
 ---
 
-*Document Version: 1.0*
+*Document Version: 1.1*
 *Last Updated: January 2026*
 *Authors: DiSSCo Technical Team*
